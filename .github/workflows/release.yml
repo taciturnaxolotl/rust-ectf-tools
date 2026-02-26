@@ -19,12 +19,12 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
             name: ectf-tools-x86_64-apple-darwin
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            name: ectf-tools-x86_64-unknown-linux-gnu
-          - target: aarch64-unknown-linux-gnu
+            name: ectf-tools-x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-            name: ectf-tools-aarch64-unknown-linux-gnu
+            name: ectf-tools-aarch64-unknown-linux-musl
 
     runs-on: ${{ matrix.os }}
 
@@ -37,14 +37,18 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: contains(matrix.target, 'linux-musl')
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y musl-tools
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
 
       - name: Build
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
