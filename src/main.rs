@@ -1,3 +1,5 @@
+mod api;
+mod config;
 mod fthr;
 mod log;
 mod protocol;
@@ -67,6 +69,164 @@ enum TopLevel {
     Completions {
         /// Shell to generate completions for
         shell: Shell,
+    },
+    /// Create or update the configuration file
+    Config {
+        /// Team API token
+        #[arg(long)]
+        token: Option<String>,
+        /// Git repository URL
+        #[arg(long)]
+        git_url: Option<String>,
+        /// API URL
+        #[arg(long)]
+        api_url: Option<String>,
+        /// Overwrite existing config
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Open the API documentation website
+    Docs,
+    /// Open the eCTF rules website
+    Rules,
+    /// Interact with the API
+    #[command(arg_required_else_help = true)]
+    Api {
+        #[command(subcommand)]
+        command: ApiCmd,
+    },
+}
+
+// ─── API subcommands ───
+
+#[derive(Subcommand)]
+enum ApiCmd {
+    /// Submit your design to Handoff
+    Submit {
+        /// Git commit hash
+        commit: String,
+    },
+    /// Submit a PNG for the Team Photo flag
+    Photo {
+        /// PNG file to submit
+        file: PathBuf,
+    },
+    /// Submit a PDF for the Design Doc flag
+    Design {
+        /// PDF file to submit
+        file: PathBuf,
+    },
+    /// Submit a digest for the Steal Design flag
+    Steal {
+        /// Target team identifier
+        team: String,
+        /// Hex digest string
+        digest: String,
+    },
+    /// Get the list of available packages
+    List,
+    /// Download an Attack Package
+    Get {
+        /// Package name
+        package: String,
+        /// Output path
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Overwrite if file exists
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Test that your design can be cloned by the API
+    #[command(arg_required_else_help = true)]
+    Clone {
+        #[command(subcommand)]
+        command: FlowCmd,
+    },
+    /// Test your design with the API
+    #[command(arg_required_else_help = true)]
+    Test {
+        #[command(subcommand)]
+        command: FlowCmd,
+    },
+    /// Submit to the remote attack scenario
+    #[command(arg_required_else_help = true)]
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum FlowCmd {
+    /// List recent flows
+    Ls {
+        /// Number of flows to show (0 for all)
+        #[arg(short, long, default_value = "5")]
+        number: usize,
+    },
+    /// Get flow details
+    Info {
+        /// Flow ID
+        id: String,
+    },
+    /// Submit a commit
+    Submit {
+        /// Git commit hash
+        commit: String,
+        /// Override git URL
+        #[arg(short, long)]
+        url: Option<String>,
+    },
+    /// Cancel a flow
+    Cancel {
+        /// Flow ID
+        id: String,
+    },
+    /// Download job output
+    Get {
+        /// Job ID
+        job_id: String,
+        /// Output file path
+        out: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum RemoteCmd {
+    /// Connect to the remote attack scenario
+    Connect {
+        /// HSM management serial port
+        management_port: String,
+        /// Transfer interface UART port
+        transfer_port: String,
+        /// Target team identifier
+        team: String,
+        /// Timeout in seconds
+        #[arg(short, long, default_value = "120")]
+        timeout: u64,
+    },
+    /// List recent remote flows
+    Ls {
+        /// Number of flows to show (0 for all)
+        #[arg(short, long, default_value = "5")]
+        number: usize,
+    },
+    /// Get remote flow details
+    Info {
+        /// Flow ID
+        id: String,
+    },
+    /// Cancel a remote flow
+    Cancel {
+        /// Flow ID
+        id: String,
+    },
+    /// Download remote job output
+    Get {
+        /// Job ID
+        job_id: String,
+        /// Output file path
+        out: PathBuf,
     },
 }
 
@@ -273,14 +433,169 @@ fn main() {
     }
 }
 
+fn open_url(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn()?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn()?;
+    }
+    Ok(())
+}
+
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         TopLevel::Tools { port, command } => run_tools(&port, command),
         TopLevel::Hw { port, command } => run_hw(&port, command),
         TopLevel::Completions { shell } => {
-            clap_complete::generate(shell, &mut Cli::command(), "ectf-tools", &mut std::io::stdout());
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "ectf-tools",
+                &mut std::io::stdout(),
+            );
             Ok(())
         }
+        TopLevel::Config {
+            token,
+            git_url,
+            api_url,
+            force,
+        } => run_config(token, git_url, api_url, force),
+        TopLevel::Docs => {
+            open_url("https://sb.ectf.mitre.org/")?;
+            log::success("Opened API documentation");
+            Ok(())
+        }
+        TopLevel::Rules => {
+            open_url("https://rules.ectf.mitre.org/")?;
+            log::success("Opened eCTF rules");
+            Ok(())
+        }
+        TopLevel::Api { command } => run_api(command),
+    }
+}
+
+// ─── Config ───
+
+fn prompt(label: &str, default: Option<&str>) -> Result<String> {
+    use std::io::Write;
+    match default {
+        Some(d) => eprint!("{label} [{d}]: "),
+        None => eprint!("{label}: "),
+    }
+    std::io::stderr().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let input = input.trim().to_string();
+    if input.is_empty() {
+        default
+            .map(|d| d.to_string())
+            .context(format!("{label} is required"))
+    } else {
+        Ok(input)
+    }
+}
+
+fn run_config(
+    token: Option<String>,
+    git_url: Option<String>,
+    api_url: Option<String>,
+    force: bool,
+) -> Result<()> {
+    let has_args = token.is_some() || git_url.is_some() || api_url.is_some() || force;
+
+    // No args: print existing config or prompt for new one
+    if !has_args && config::Config::exists() {
+        let cfg = config::Config::load()?;
+        log::info(&format!("token:   {}", cfg.token));
+        log::info(&format!("git_url: {}", cfg.git_url));
+        log::info(&format!("api_url: {}", cfg.api_url));
+        return Ok(());
+    }
+
+    let existing = if config::Config::exists() && !force {
+        Some(config::Config::load()?)
+    } else {
+        None
+    };
+
+    let token = match token {
+        Some(t) => t,
+        None => prompt("Token", existing.as_ref().map(|c| c.token.as_str()))?,
+    };
+    let git_url = match git_url {
+        Some(g) => g,
+        None => prompt("Git URL", existing.as_ref().map(|c| c.git_url.as_str()))?,
+    };
+    let api_url = match api_url {
+        Some(a) => a,
+        None => prompt(
+            "API URL",
+            Some(
+                existing
+                    .as_ref()
+                    .map(|c| c.api_url.as_str())
+                    .unwrap_or(config::DEFAULT_API_URL),
+            ),
+        )?,
+    };
+
+    config::Config { token, git_url, api_url }.save()?;
+
+    log::success(&format!(
+        "Config saved to {}",
+        config::Config::path()?.display()
+    ));
+    Ok(())
+}
+
+// ─── API commands ───
+
+fn run_api(cmd: ApiCmd) -> Result<()> {
+    match cmd {
+        ApiCmd::Submit { commit } => api::cmd_submit(&commit),
+        ApiCmd::Photo { file } => api::cmd_photo(&file),
+        ApiCmd::Design { file } => api::cmd_design(&file),
+        ApiCmd::Steal { team, digest } => api::cmd_steal(&team, &digest),
+        ApiCmd::List => api::cmd_list_packages(),
+        ApiCmd::Get {
+            package,
+            out,
+            force,
+        } => api::cmd_get_package(&package, out.as_ref(), force),
+        ApiCmd::Clone { command } => run_flow("clone", command),
+        ApiCmd::Test { command } => run_flow("test", command),
+        ApiCmd::Remote { command } => run_remote(command),
+    }
+}
+
+fn run_flow(flow: &str, cmd: FlowCmd) -> Result<()> {
+    match cmd {
+        FlowCmd::Ls { number } => api::cmd_flow_list(flow, number),
+        FlowCmd::Info { id } => api::cmd_flow_info(flow, &id),
+        FlowCmd::Submit { commit, url } => {
+            api::cmd_flow_submit(flow, &commit, url.as_deref())
+        }
+        FlowCmd::Cancel { id } => api::cmd_flow_cancel(flow, &id),
+        FlowCmd::Get { job_id, out } => api::cmd_flow_get(flow, &job_id, &out),
+    }
+}
+
+fn run_remote(cmd: RemoteCmd) -> Result<()> {
+    match cmd {
+        RemoteCmd::Connect {
+            management_port,
+            transfer_port,
+            team,
+            timeout,
+        } => api::cmd_remote_connect(&management_port, &transfer_port, &team, timeout),
+        RemoteCmd::Ls { number } => api::cmd_flow_list("remote", number),
+        RemoteCmd::Info { id } => api::cmd_flow_info("remote", &id),
+        RemoteCmd::Cancel { id } => api::cmd_flow_cancel("remote", &id),
+        RemoteCmd::Get { job_id, out } => api::cmd_flow_get("remote", &job_id, &out),
     }
 }
 

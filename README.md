@@ -4,11 +4,19 @@
 
 Drop-in replacement for MITRE's `uvx ectf` CLI, rewritten in Rust with reliable serial I/O. Uses raw termios instead of pyserial to avoid macOS CDC-ACM data corruption bugs.
 
-## Usage
+## Install
+
+```bash
+brew install taciturnaxolotl/tap/ectf-tools
+```
+
+Or build from source:
 
 ```bash
 cargo build --release
 ```
+
+## Usage
 
 ### HSM Host Tools
 
