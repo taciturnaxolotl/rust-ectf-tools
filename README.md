@@ -1,5 +1,7 @@
 # rust-ectf-tools
 
+![vhs gif](https://vhs.charm.sh/vhs-27M7tCPh4cNTI2EM5Z0yLi.gif)
+
 Drop-in replacement for MITRE's `uvx ectf` CLI, rewritten in Rust with reliable serial I/O. Uses raw termios instead of pyserial to avoid macOS CDC-ACM data corruption bugs.
 
 ## Usage
