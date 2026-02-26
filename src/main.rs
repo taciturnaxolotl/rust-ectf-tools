@@ -9,7 +9,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::builder::styling::{AnsiColor, Effects, Styles};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use protocol::{HSMIntf, Opcode};
 
 const STYLES: Styles = Styles::styled()
@@ -61,6 +62,11 @@ enum TopLevel {
         port: String,
         #[command(subcommand)]
         command: HwCmd,
+    },
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        shell: Shell,
     },
 }
 
@@ -271,6 +277,10 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         TopLevel::Tools { port, command } => run_tools(&port, command),
         TopLevel::Hw { port, command } => run_hw(&port, command),
+        TopLevel::Completions { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "ectf-tools", &mut std::io::stdout());
+            Ok(())
+        }
     }
 }
 
