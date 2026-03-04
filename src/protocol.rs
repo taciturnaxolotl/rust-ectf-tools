@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 
 use anyhow::{Result, bail};
 
@@ -81,7 +82,10 @@ impl HSMIntf {
     fn write_all(&mut self, data: &[u8]) -> Result<()> {
         log::trace_hex("TX", data);
         self.file.write_all(data)?;
-        self.file.flush()?;
+        // tcdrain ensures all written data is transmitted before returning.
+        // File::flush() is a no-op for std::fs::File, so without this,
+        // macOS CDC-ACM may buffer writes and cause protocol desync.
+        unsafe { libc::tcdrain(self.file.as_raw_fd()); }
         Ok(())
     }
 
