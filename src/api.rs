@@ -124,7 +124,6 @@ const YELLOW: &str = "\x1b[33m";
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const BLUE: &str = "\x1b[34m";
-const DIM: &str = "\x1b[38;5;242m";
 
 /// Auto-highlight a value like Rich's highlighter:
 /// UUIDs/hashes → yellow, booleans → green/red, URLs → blue, else → cyan

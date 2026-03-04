@@ -282,6 +282,18 @@ enum ToolsCmd {
         /// Destination slot on this HSM (0-7)
         write_slot: u8,
     },
+    /// Run the test suite against real hardware
+    Test {
+        /// 6-char hex PIN
+        pin: String,
+        /// Group ID (decimal or 0xHEX)
+        gid: String,
+        /// Second HSM serial port for transfer tests
+        transfer_port: Option<String>,
+        /// Skip tests requiring a second HSM
+        #[arg(long)]
+        no_transfer: bool,
+    },
 }
 
 // ─── HW subcommands ───
@@ -749,9 +761,563 @@ fn run_tools(port: &str, cmd: ToolsCmd) -> Result<()> {
                 "Receive successful. Wrote file to local slot {write_slot}"
             ));
         }
+
+        ToolsCmd::Test {
+            pin,
+            gid,
+            transfer_port,
+            no_transfer,
+        } => {
+            validate_pin(&pin)?;
+            let gid = parse_gid(&gid)?;
+
+            if !no_transfer && transfer_port.is_none() {
+                bail!("Transfer port required unless --no-transfer is passed");
+            }
+
+            let mut hsm2 = match &transfer_port {
+                Some(p) if !no_transfer => {
+                    Some(HSMIntf::open(p).context("Failed to open transfer serial port")?)
+                }
+                _ => None,
+            };
+
+            return run_test(&mut hsm, hsm2.as_mut(), &pin, gid, no_transfer);
+        }
     }
 
     Ok(())
+}
+
+// ─── Test runner ───
+
+fn write_frame(pin: &str, slot: u8, gid: u16, filename: &str, content: &[u8]) -> Vec<u8> {
+    let mut name_buf = [0u8; MAX_NAME_LEN];
+    let name_bytes = filename.as_bytes();
+    name_buf[..name_bytes.len().min(MAX_NAME_LEN)]
+        .copy_from_slice(&name_bytes[..name_bytes.len().min(MAX_NAME_LEN)]);
+    let uuid_bytes = *uuid::Uuid::new_v4().as_bytes();
+
+    let mut frame = Vec::with_capacity(59 + content.len());
+    frame.extend_from_slice(pin.as_bytes());
+    frame.push(slot);
+    frame.extend_from_slice(&gid.to_le_bytes());
+    frame.extend_from_slice(&name_buf);
+    frame.extend_from_slice(&uuid_bytes);
+    frame.extend_from_slice(&(content.len() as u16).to_le_bytes());
+    frame.extend_from_slice(content);
+    frame
+}
+
+fn read_frame(pin: &str, slot: u8) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(7);
+    frame.extend_from_slice(pin.as_bytes());
+    frame.push(slot);
+    frame
+}
+
+fn recv_frame(pin: &str, read_slot: u8, write_slot: u8) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(8);
+    frame.extend_from_slice(pin.as_bytes());
+    frame.push(read_slot);
+    frame.push(write_slot);
+    frame
+}
+
+fn run_test(
+    hsm: &mut HSMIntf,
+    mut hsm2: Option<&mut HSMIntf>,
+    pin: &str,
+    gid: u16,
+    no_transfer: bool,
+) -> Result<()> {
+    struct TestResult {
+        name: &'static str,
+        passed: bool,
+    }
+
+    let mut results: Vec<TestResult> = Vec::new();
+
+    macro_rules! run_test {
+        ($name:expr, $body:expr) => {{
+            log::info(&format!("Running: {}", $name));
+            let start = std::time::Instant::now();
+            match (|| -> Result<()> { $body })() {
+                Ok(()) => {
+                    let elapsed = start.elapsed();
+                    log::success(&format!("{} passed ({:.1}s)", $name, elapsed.as_secs_f64()));
+                    results.push(TestResult { name: $name, passed: true });
+                }
+                Err(e) => {
+                    let elapsed = start.elapsed();
+                    log::error(&format!("{} FAILED ({:.1}s): {e}", $name, elapsed.as_secs_f64()));
+                    results.push(TestResult { name: $name, passed: false });
+                }
+            }
+        }};
+    }
+
+    // Timing limits from the eCTF spec (milliseconds)
+    const TIME_LIST: u128 = 500;
+    const TIME_READ: u128 = 3000;
+    const TIME_WRITE: u128 = 3000;
+    const TIME_RECEIVE: u128 = 3000;
+    const TIME_INTERROGATE: u128 = 1000;
+    const TIME_BAD_PIN: u128 = 5000;
+
+    macro_rules! timed {
+        ($hsm:expr, $op:expr, $frame:expr, $limit_ms:expr) => {{
+            let t = std::time::Instant::now();
+            let res = $hsm.send_respond($op, $frame);
+            let ms = t.elapsed().as_millis();
+            if ms > $limit_ms {
+                bail!(
+                    "{:?} took {}ms, exceeds {}ms limit",
+                    $op, ms, $limit_ms
+                );
+            }
+            res
+        }};
+    }
+
+    // A different group ID for permission tests
+    let bad_gid: u16 = if gid == 0xFFFF { gid - 1 } else { gid + 1 };
+
+    // Slot usage plan:
+    //   0: write_1, overwrite, write_max_file_name, write_max_file_size
+    //   1: write_all_ascii
+    //   2: (reserved for write_max)
+    //   3: read_without_perms (bad_gid), write_without_perms
+    //   4: write_0_byte_file
+    //   5,6,7: write_max
+
+    // ── list_empty: verify HSM starts with no files ──
+
+    run_test!("list_empty", {
+        let resp = timed!(hsm, Opcode::List, pin.as_bytes(), TIME_LIST)?;
+        let files = unpack_files(&resp.body)?;
+        if !files.is_empty() {
+            bail!("Expected 0 files, found {}", files.len());
+        }
+        Ok(())
+    });
+
+    // ── write_1: write file to slot 0, read back, verify ──
+
+    let write1_content = b"Hi this will be the text inside the file";
+    run_test!("write_1", {
+        let frame = write_frame(pin, 0, gid, "test.txt", write1_content);
+        timed!(hsm, Opcode::Write, &frame, TIME_WRITE)?;
+
+        let resp = timed!(hsm, Opcode::Read, &read_frame(pin, 0), TIME_READ)?;
+        if resp.body.len() < MAX_NAME_LEN {
+            bail!("Read response too short");
+        }
+        let contents = &resp.body[MAX_NAME_LEN..];
+        if contents != write1_content.as_slice() {
+            bail!(
+                "Content mismatch: expected {} bytes, got {} bytes",
+                write1_content.len(),
+                contents.len()
+            );
+        }
+        Ok(())
+    });
+
+    // ── interrogate_1 + receive_1: two-HSM file transfer ──
+
+    if !no_transfer {
+        let hsm2 = hsm2.as_deref_mut().expect("transfer HSM required");
+
+        run_test!("interrogate_1", {
+            hsm2.send_respond(Opcode::Listen, &[])?;
+            let resp = timed!(hsm, Opcode::Interrogate, pin.as_bytes(), TIME_INTERROGATE)?;
+            let files = unpack_files(&resp.body)?;
+            if files.is_empty() {
+                bail!("Interrogation returned no files");
+            }
+            Ok(())
+        });
+
+        run_test!("receive_1", {
+            hsm2.send_respond(Opcode::Listen, &[])?;
+            timed!(hsm, Opcode::Interrogate, pin.as_bytes(), TIME_INTERROGATE)?;
+            timed!(hsm2, Opcode::Receive, &recv_frame(pin, 0, 1), TIME_RECEIVE)?;
+            Ok(())
+        });
+    }
+
+    // ── overwrite: overwrite slot 0 with new content ──
+
+    run_test!("overwrite", {
+        let content = b"This file will be overwriting an existing file";
+        let frame = write_frame(pin, 0, gid, "overwriting_file.txt", content);
+        timed!(hsm, Opcode::Write, &frame, TIME_WRITE)?;
+
+        let resp = timed!(hsm, Opcode::Read, &read_frame(pin, 0), TIME_READ)?;
+        if resp.body.len() < MAX_NAME_LEN {
+            bail!("Read response too short");
+        }
+        let got = &resp.body[MAX_NAME_LEN..];
+        if got != content.as_slice() {
+            bail!("Overwrite content mismatch");
+        }
+        Ok(())
+    });
+
+    // ── pass_file_back_and_forth: transfer with different gid ──
+
+    if !no_transfer {
+        let hsm2 = hsm2.as_deref_mut().expect("transfer HSM required");
+
+        run_test!("pass_file_back_and_forth", {
+            // Write file with a different gid on hsm
+            let other_gid: u16 = gid.wrapping_add(0x1000);
+            let content = b"This file will be passed back and forth";
+            let frame = write_frame(pin, 0, other_gid, "passed_file.txt", content);
+            timed!(hsm, Opcode::Write, &frame, TIME_WRITE)?;
+
+            // Transfer hsm → hsm2 (slot 0 → slot 0)
+            hsm2.send_respond(Opcode::Listen, &[])?;
+            timed!(hsm, Opcode::Interrogate, pin.as_bytes(), TIME_INTERROGATE)?;
+            timed!(hsm2, Opcode::Receive, &recv_frame(pin, 0, 0), TIME_RECEIVE)?;
+
+            // Transfer hsm2 → hsm (slot 0 → slot 0)
+            hsm.send_respond(Opcode::Listen, &[])?;
+            timed!(hsm2, Opcode::Interrogate, pin.as_bytes(), TIME_INTERROGATE)?;
+            timed!(hsm, Opcode::Receive, &recv_frame(pin, 0, 0), TIME_RECEIVE)?;
+            Ok(())
+        });
+    }
+
+    // ── write_max_file_name: 32-char filename (max length) ──
+
+    run_test!("write_max_file_name", {
+        // 31 visible chars + null terminator fills 32-byte name buffer
+        let content = b"Hi this will be the text inside the file";
+        let frame = write_frame(pin, 0, gid, "this_filename_is_of_max_size_32", content);
+        timed!(hsm, Opcode::Write, &frame, TIME_WRITE)?;
+        Ok(())
+    });
+
+    // ── write_max_file_size: 8192-byte file (maximum) ──
+    // Uses the same Julius Caesar text as the remote test suite.
+
+    let max_content = {
+        const BRUTUS: &[u8] = b" SCENE II. A public place. Flourish. Enter CAESAR; \
+ANTONY, for the course; CALPURNIA, PORTIA, DECIUS BRUTUS, CICERO, BRUTUS, CASSIUS, \
+and CASCA; a great crowd following, among them a Soothsayer CAESAR Calpurnia! CASCA \
+Peace, ho! Caesar speaks. CAESAR Calpurnia! CALPURNIA Here, my lord. CAESAR Stand \
+you directly in Antonius' way, When he doth run his course. Antonius! ANTONY \
+Caesar, my lord? CAESAR Forget not, in your speed, Antonius, To touch Calpurnia; \
+for our elders say, The barren, touched in this holy chase, Shake off their sterile \
+curse. ANTONY I shall remember: When Caesar says 'do this,' it is perform'd. CAESAR \
+Set on; and leave no ceremony out. Flourish Soothsayer Caesar! CAESAR Ha! who \
+calls? CASCA Bid every noise be still: peace yet again! CAESAR Who is it in the \
+press that calls on me? I hear a tongue, shriller than all the music, Cry 'Caesar!' \
+Speak; Caesar is turn'd to hear. Soothsayer Beware the ides of March. CAESAR What \
+man is that? BRUTUS A soothsayer bids you beware the ides of March. CAESAR Set him \
+before me; let me see his face. CASSIUS Fellow, come from the throng; look upon \
+Caesar. CAESAR What say'st thou to me now? speak once again. Soothsayer Beware the \
+ides of March. CAESAR He is a dreamer; let us leave him: pass. Sennet. Exeunt all \
+except BRUTUS and CASSIUS CASSIUS Will you go see the order of the course? BRUTUS \
+Not I. CASSIUS I pray you, do. BRUTUS I am not gamesome: I do lack some part Of \
+that quick spirit that is in Antony. Let me not hinder, Cassius, your desires; \
+I'll leave you. CASSIUS Brutus, I do observe you now of late: I have not from your \
+eyes that gentleness And show of love as I was wont to have: You bear too stubborn \
+and too strange a hand Over your friend that loves you. BRUTUS Cassius, Be not \
+deceived: if I have veil'd my look, I turn the trouble of my countenance Merely \
+upon myself. Vexed I am Of late with passions of some difference, Conceptions only \
+proper to myself, Which give some soil perhaps to my behaviors; But let not \
+therefore my good friends be grieved- Among which number, Cassius, be you one- Nor \
+construe any further my neglect, Than that poor Brutus, with himself at war, \
+Forgets the shows of love to other men. CASSIUS Then, Brutus, I have much mistook \
+your passion; By means whereof this breast of mine hath buried Thoughts of great \
+value, worthy cogitations. Tell me, good Brutus, can you see your face? BRUTUS No, \
+Cassius; for the eye sees not itself, But by reflection, by some other things. \
+CASSIUS Tis just: And it is very much lamented, Brutus, That you have no such \
+mirrors as will turn Your hidden worthiness into your eye, That you might see your \
+shadow. I have heard, Where many of the best respect in Rome, Except immortal \
+Caesar, speaking of Brutus And groaning underneath this age's yoke, Have wish'd \
+that noble Brutus had his eyes. BRUTUS Into what dangers would you lead me, \
+Cassius, That you would have me seek into myself For that which is not in me? \
+CASSIUS Therefore, good Brutus, be prepared to hear: And since you know you cannot \
+see yourself So well as by reflection, I, your glass, Will modestly discover to \
+yourself That of yourself which you yet know not of. And be not jealous on me, \
+gentle Brutus: Were I a common laugher, or did use To stale with ordinary oaths my \
+love To every new protester; if you know That I do fawn on men and hug them hard \
+And after scandal them, or if you know That I profess myself in banqueting To all \
+the rout, then hold me dangerous. Flourish, and shout BRUTUS What means this \
+shouting? I do fear, the people Choose Caesar for their king. CASSIUS Ay, do you \
+fear it? Then must I think you would not have it so. BRUTUS I would not, Cassius; \
+yet I love him well. But wherefore do you hold me here so long? What is it that \
+you would impart to me? If it be aught toward the general good, Set honour in one \
+eye and death i' the other, And I will look on both indifferently, For let the gods \
+so speed me as I love The name of honour more than I fear death. CASSIUS I know \
+that virtue to be in you, Brutus, As well as I do know your outward favour. Well, \
+honour is the subject of my story. I cannot tell what you and other men Think of \
+this life; but, for my single self, I had as lief not be as live to be In awe of \
+such a thing as I myself. I was born free as Caesar; so were you: We both have fed \
+as well, and we can both Endure the winter's cold as well as he: For once, upon a \
+raw and gusty day, The troubled Tiber chafing with her shores, Caesar said to me \
+'Darest thou, Cassius, now Leap in with me into this angry flood, And swim to \
+yonder point?' Upon the word, Accoutred as I was, I plunged in And bade him \
+follow; so indeed he did. The torrent roar'd, and we did buffet it With lusty \
+sinews, throwing it aside And stemming it with hearts of controversy; But ere we \
+could arrive the point proposed, Caesar cried 'Help me, Cassius, or I sink!' I, as \
+Aeneas, our great ancestor, Did from the flames of Troy upon his shoulder The old \
+Anchises bear, so from the waves of Tiber Did I the tired Caesar. And this man Is \
+now become a god, and Cassius is A wretched creature and must bend his body, If \
+Caesar carelessly but nod on him. He had a fever when he was in Spain, And when the \
+fit was on him, I did mark How he did shake: 'tis true, this god did shake; His \
+coward lips did from their colour fly, And that same eye whose bend doth awe the \
+world Did lose his lustre: I did hear him groan: Ay, and that tongue of his that \
+bade the Romans Mark him and write his speeches in their books, Alas, it cried \
+'Give me some drink, Titinius,' As a sick girl. Ye gods, it doth amaze me A man of \
+such a feeble temper should So get the start of the majestic world And bear the \
+palm alone. Shout. Flourish BRUTUS Another general shout! I do believe that these \
+applauses are For some new honours that are heap'd on Caesar. CASSIUS Why, man, he \
+doth bestride the narrow world Like a Colossus, and we petty men Walk under his \
+huge legs and peep about To find ourselves dishonourable graves. Men at some time \
+are masters of their fates: The fault, dear Brutus, is not in our stars, But in \
+ourselves, that we are underlings. Brutus and Caesar: what should be in that \
+'Caesar'? Why should that name be sounded more than yours? Write them together, \
+yours is as fair a name; Sound them, it doth become the mouth as well; Weigh them, \
+it is as heavy; conjure with 'em, Brutus will start a spirit as soon as Caesar. \
+Now, in the names of all the gods at once, Upon what meat doth this our Caesar \
+feed, That he is grown so great? Age, thou art shamed! Rome, thou hast lost the \
+breed of noble bloods! When went there by an age, since the great flood, But it was \
+famed with more than with one man? When could they say till now, that talk'd of \
+Rome, That her wide walls encompass'd but one man? Now is it Rome indeed and room \
+enough, When there is in it but one only man. O, you and I have heard our fathers \
+say, There was a Brutus once that would have brook'd The eternal devil to keep his \
+state in Rome As easily as a king. BRUTUS That you do love me, I am nothing \
+jealous; What you would work me to, I have some aim: How I have thought of this and \
+of these times, I shall recount hereafter; for this present, I would not, so with \
+love I might entreat you, Be any further moved. What you have said I will consider; \
+what you have to say I will with patience hear, and find a time Both meet to hear \
+and answer such high things. Till then, my noble friend, chew upon this: Brutus had \
+rather be a villager Than to repute himself a son of Rome Under these hard \
+conditions as this time Is like to lay upon us. CASSIUS I am glad that my weak \
+words Have struck but thus much show of fire from Brutus. BRUTUS The games are done \
+and Caesar is returning. CASSIUS As they pass by, pluck Casca by the sleeve; And \
+he will, after his sour fashion, tell you What hath proceeded worthy note to-day. \
+Re-enter CAESAR and his Train BRUTUS I will do so. But, look you, Cassius, The \
+angry spot doth glow on Caesar's brow, And all the rest look like a chidden train: \
+Calpurnia's cheek is pale; and Cicero Looks with such ferret and such fiery eyes \
+As we have seen him in the Capitol, Being cross";
+        let mut buf = Vec::with_capacity(MAX_FILE_LEN);
+        while buf.len() < MAX_FILE_LEN {
+            let remaining = MAX_FILE_LEN - buf.len();
+            buf.extend_from_slice(&BRUTUS[..remaining.min(BRUTUS.len())]);
+        }
+        buf
+    };
+    run_test!("write_max_file_size", {
+        let frame = write_frame(pin, 0, gid, "full_file_0.out", &max_content);
+        timed!(hsm, Opcode::Write, &frame, TIME_WRITE)?;
+
+        let resp = timed!(hsm, Opcode::Read, &read_frame(pin, 0), TIME_READ)?;
+        if resp.body.len() < MAX_NAME_LEN {
+            bail!("Read response too short");
+        }
+        let got = &resp.body[MAX_NAME_LEN..];
+        if got.len() != MAX_FILE_LEN {
+            bail!("Expected {MAX_FILE_LEN} bytes, got {}", got.len());
+        }
+        if got != max_content.as_slice() {
+            bail!("Max-size file content mismatch");
+        }
+        Ok(())
+    });
+
+    // ── receive_max_file: transfer the 8192-byte file ──
+
+    if !no_transfer {
+        let hsm2 = hsm2.as_deref_mut().expect("transfer HSM required");
+
+        run_test!("receive_max_file", {
+            hsm2.send_respond(Opcode::Listen, &[])?;
+            timed!(hsm, Opcode::Interrogate, pin.as_bytes(), TIME_INTERROGATE)?;
+            timed!(hsm2, Opcode::Receive, &recv_frame(pin, 0, 2), TIME_RECEIVE)?;
+            Ok(())
+        });
+    }
+
+    // ── write_all_ascii: write all 256 byte values 0x00-0xFF ──
+
+    run_test!("write_all_ascii", {
+        let content: Vec<u8> = (0..=255u8).collect();
+        let frame = write_frame(pin, 1, gid, "all_ascii.txt", &content);
+        timed!(hsm, Opcode::Write, &frame, TIME_WRITE)?;
+
+        let resp = timed!(hsm, Opcode::Read, &read_frame(pin, 1), TIME_READ)?;
+        if resp.body.len() < MAX_NAME_LEN {
+            bail!("Read response too short");
+        }
+        let got = &resp.body[MAX_NAME_LEN..];
+        if got != content.as_slice() {
+            bail!("All-ASCII content mismatch");
+        }
+        Ok(())
+    });
+
+    // ── bad_pin: wrong pin should error, HSM should still work after ──
+
+    run_test!("bad_pin", {
+        // Send a deliberately wrong (too-short) pin — allowed up to 5s
+        let bad_result = timed!(hsm, Opcode::List, b"ecd7", TIME_BAD_PIN);
+        if bad_result.is_ok() {
+            bail!("Expected bad pin to fail, but it succeeded");
+        }
+
+        // Verify HSM still works with correct pin
+        timed!(hsm, Opcode::List, pin.as_bytes(), TIME_LIST)?;
+        Ok(())
+    });
+
+    // ── Permission tests: require two HSMs with different gid/permission sets ──
+
+    if !no_transfer {
+        let hsm2 = hsm2.as_deref_mut().expect("transfer HSM required");
+
+        // read_without_perms: HSM B writes file with bad_gid, HSM A tries to read
+        run_test!("read_without_perms", {
+            let content = b"This file should not be readable by the HSM that wrote the data";
+            let frame = write_frame(pin, 3, bad_gid, "non_readable.txt", content);
+            timed!(hsm2, Opcode::Write, &frame, TIME_WRITE)?;
+
+            hsm2.send_respond(Opcode::Listen, &[])?;
+            timed!(hsm, Opcode::Interrogate, pin.as_bytes(), TIME_INTERROGATE)?;
+
+            match timed!(hsm, Opcode::Receive, &recv_frame(pin, 3, 3), TIME_RECEIVE) {
+                Err(_) => {} // expected: gid mismatch on receive
+                Ok(_) => bail!("Expected receive to fail with wrong group ID, but it succeeded"),
+            }
+            Ok(())
+        });
+
+        // write_without_perms: HSM B writes file with bad_gid, HSM A tries to overwrite
+        run_test!("write_without_perms", {
+            let content = b"This file should not be receivable on HSM A";
+            let frame = write_frame(pin, 3, gid, "replacement.txt", content);
+            match timed!(hsm, Opcode::Write, &frame, TIME_WRITE) {
+                Err(_) => {} // expected: gid mismatch on overwrite
+                Ok(_) => bail!("Expected overwrite to fail with wrong group ID, but it succeeded"),
+            }
+            Ok(())
+        });
+
+        // receive_without_perms: HSM B writes file with bad_gid, HSM A tries to receive
+        run_test!("receive_without_perms", {
+            let content = b"This file should not be receivable on HSM A";
+            let frame = write_frame(pin, 3, bad_gid, "non_receivable.txt", content);
+            timed!(hsm2, Opcode::Write, &frame, TIME_WRITE)?;
+
+            hsm.send_respond(Opcode::Listen, &[])?;
+            timed!(hsm2, Opcode::Interrogate, pin.as_bytes(), TIME_INTERROGATE)?;
+
+            match timed!(hsm, Opcode::Receive, &recv_frame(pin, 3, 3), TIME_RECEIVE) {
+                Err(_) => {} // expected: gid mismatch
+                Ok(_) => bail!("Expected receive to fail with wrong group ID, but it succeeded"),
+            }
+            Ok(())
+        });
+    }
+
+    // ── write_0_byte_file: write file with 0 bytes content to slot 4 ──
+    // Remote sends: pin + slot + gid + "no_contents.txt" + uuid + len(0x0000)
+    // Total frame = 59 bytes, no content appended.
+
+    run_test!("write_0_byte_file", {
+        let frame = write_frame(pin, 4, gid, "no_contents.txt", &[]);
+        timed!(hsm, Opcode::Write, &frame, TIME_WRITE)?;
+        Ok(())
+    });
+
+    // ── read_0_byte_file: LIST and verify the 0-byte file appears ──
+    // Note: the remote test does a LIST here, NOT a READ.
+
+    run_test!("read_0_byte_file", {
+        let resp = timed!(hsm, Opcode::List, pin.as_bytes(), TIME_LIST)?;
+        let files = unpack_files(&resp.body)?;
+        let found = files.iter().any(|(slot, _, name)| *slot == 4 && name == "no_contents.txt");
+        if !found {
+            bail!("0-byte file not found in file listing");
+        }
+        Ok(())
+    });
+
+    // ── read_back_0_byte: READ slot 4, verify empty content ──
+    // (Extra test not in remote suite — verifies actual read returns 0 bytes)
+
+    run_test!("read_back_0_byte", {
+        let resp = timed!(hsm, Opcode::Read, &read_frame(pin, 4), TIME_READ)?;
+        if resp.body.len() < MAX_NAME_LEN {
+            bail!("Read response too short");
+        }
+        let contents = &resp.body[MAX_NAME_LEN..];
+        if !contents.is_empty() {
+            bail!("Expected empty contents, got {} bytes", contents.len());
+        }
+        Ok(())
+    });
+
+    // ── receive_0_byte_file: transfer the 0-byte file ──
+
+    if !no_transfer {
+        let hsm2 = hsm2.as_deref_mut().expect("transfer HSM required");
+
+        run_test!("receive_0_byte_file", {
+            hsm2.send_respond(Opcode::Listen, &[])?;
+            timed!(hsm, Opcode::Interrogate, pin.as_bytes(), TIME_INTERROGATE)?;
+            timed!(hsm2, Opcode::Receive, &recv_frame(pin, 4, 4), TIME_RECEIVE)?;
+            Ok(())
+        });
+    }
+
+    // ── write_max: fill remaining slots to reach 8 total ──
+    // Slots used: 0 (write_1), 1 (write_all_ascii), 3 (bad_gid), 4 (0-byte)
+    // Fill: 2, 5, 6, 7
+
+    run_test!("write_max", {
+        for &i in &[2u8, 5, 6, 7] {
+            let name = format!("file_{i}.txt");
+            let content = format!("This is file number {i}");
+            let frame = write_frame(pin, i, gid, &name, content.as_bytes());
+            timed!(hsm, Opcode::Write, &frame, TIME_WRITE)?;
+        }
+        let resp = timed!(hsm, Opcode::List, pin.as_bytes(), TIME_LIST)?;
+        let files = unpack_files(&resp.body)?;
+        if files.len() != 8 {
+            bail!("Expected 8 files, found {}", files.len());
+        }
+        Ok(())
+    });
+
+    // ── Summary ──
+
+    println!();
+    let total = results.len();
+    let passed = results.iter().filter(|r| r.passed).count();
+    let failed = total - passed;
+
+    for r in &results {
+        if r.passed {
+            log::success(&format!("  PASS  {}", r.name));
+        } else {
+            log::error(&format!("  FAIL  {}", r.name));
+        }
+    }
+
+    println!();
+    if failed == 0 {
+        log::success(&format!("All {total} tests passed"));
+        Ok(())
+    } else {
+        log::error(&format!("{failed}/{total} tests failed"));
+        bail!("{failed} test(s) failed");
+    }
 }
 
 // ─── HW commands ───
