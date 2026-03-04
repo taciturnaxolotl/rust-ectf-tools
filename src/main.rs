@@ -1276,17 +1276,24 @@ As we have seen him in the Capitol, Being cross";
         });
     }
 
-    // ── write_max: fill remaining slots to reach 8 total ──
-    // Slots used: 0 (write_1), 1 (write_all_ascii), 3 (bad_gid), 4 (0-byte)
-    // Fill: 2, 5, 6, 7
+    // ── write_max: fill all remaining empty slots to reach 8 total ──
 
     run_test!("write_max", {
-        for &i in &[2u8, 5, 6, 7] {
+        // List current files to find which slots are occupied
+        let resp = timed!(hsm, Opcode::List, pin.as_bytes(), TIME_LIST)?;
+        let files = unpack_files(&resp.body)?;
+        let occupied: std::collections::HashSet<u8> = files.iter().map(|(s, _, _)| *s).collect();
+
+        for i in 0u8..8 {
+            if occupied.contains(&i) {
+                continue;
+            }
             let name = format!("file_{i}.txt");
             let content = format!("This is file number {i}");
             let frame = write_frame(pin, i, gid, &name, content.as_bytes());
             timed!(hsm, Opcode::Write, &frame, TIME_WRITE)?;
         }
+
         let resp = timed!(hsm, Opcode::List, pin.as_bytes(), TIME_LIST)?;
         let files = unpack_files(&resp.body)?;
         if files.len() != 8 {
