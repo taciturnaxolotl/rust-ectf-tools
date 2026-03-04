@@ -32,6 +32,7 @@ const UUID_LEN: usize = 16;
 #[derive(Parser)]
 #[command(
     name = "ectf-tools",
+    version,
     about = "eCTF host tools — Rust reimplementation",
     long_about = "Drop-in replacement for MITRE's ectf CLI.\n\
                   Reliable serial I/O using raw termios instead of pyserial.",
