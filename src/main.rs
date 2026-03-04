@@ -294,6 +294,9 @@ enum ToolsCmd {
         /// Skip tests requiring a second HSM
         #[arg(long)]
         no_transfer: bool,
+        /// Output results as JSON for CI
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -768,6 +771,7 @@ fn run_tools(port: &str, cmd: ToolsCmd) -> Result<()> {
             gid,
             transfer_port,
             no_transfer,
+            json,
         } => {
             validate_pin(&pin)?;
             let gid = parse_gid(&gid)?;
@@ -783,7 +787,7 @@ fn run_tools(port: &str, cmd: ToolsCmd) -> Result<()> {
                 _ => None,
             };
 
-            return run_test(&mut hsm, hsm2.as_mut(), &pin, gid, no_transfer);
+            return run_test(&mut hsm, hsm2.as_mut(), &pin, gid, no_transfer, json);
         }
     }
 
@@ -831,28 +835,47 @@ fn run_test(
     pin: &str,
     gid: u16,
     no_transfer: bool,
+    json: bool,
 ) -> Result<()> {
     struct TestResult {
         name: &'static str,
         passed: bool,
+        duration_secs: f64,
+        error: Option<String>,
     }
 
     let mut results: Vec<TestResult> = Vec::new();
 
     macro_rules! run_test {
         ($name:expr, $body:expr) => {{
-            log::info(&format!("Running: {}", $name));
+            if !json {
+                log::info(&format!("Running: {}", $name));
+            }
             let start = std::time::Instant::now();
             match (|| -> Result<()> { $body })() {
                 Ok(()) => {
                     let elapsed = start.elapsed();
-                    log::success(&format!("{} passed ({:.1}s)", $name, elapsed.as_secs_f64()));
-                    results.push(TestResult { name: $name, passed: true });
+                    if !json {
+                        log::success(&format!("{} passed ({:.1}s)", $name, elapsed.as_secs_f64()));
+                    }
+                    results.push(TestResult {
+                        name: $name,
+                        passed: true,
+                        duration_secs: elapsed.as_secs_f64(),
+                        error: None,
+                    });
                 }
                 Err(e) => {
                     let elapsed = start.elapsed();
-                    log::error(&format!("{} FAILED ({:.1}s): {e}", $name, elapsed.as_secs_f64()));
-                    results.push(TestResult { name: $name, passed: false });
+                    if !json {
+                        log::error(&format!("{} FAILED ({:.1}s): {e}", $name, elapsed.as_secs_f64()));
+                    }
+                    results.push(TestResult {
+                        name: $name,
+                        passed: false,
+                        duration_secs: elapsed.as_secs_f64(),
+                        error: Some(e.to_string()),
+                    });
                 }
             }
         }};
@@ -1305,27 +1328,57 @@ As we have seen him in the Capitol, Being cross";
 
     // ── Summary ──
 
-    println!();
     let total = results.len();
     let passed = results.iter().filter(|r| r.passed).count();
     let failed = total - passed;
 
-    for r in &results {
-        if r.passed {
-            log::success(&format!("  PASS  {}", r.name));
+    if json {
+        let tests: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                let mut obj = serde_json::Map::new();
+                obj.insert("name".into(), serde_json::Value::String(r.name.into()));
+                obj.insert("passed".into(), serde_json::Value::Bool(r.passed));
+                obj.insert(
+                    "duration_secs".into(),
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(r.duration_secs).unwrap(),
+                    ),
+                );
+                if let Some(e) = &r.error {
+                    obj.insert("error".into(), serde_json::Value::String(e.clone()));
+                }
+                serde_json::Value::Object(obj)
+            })
+            .collect();
+        let output = serde_json::json!({
+            "total": total,
+            "passed": passed,
+            "failed": failed,
+            "tests": tests,
+        });
+        println!("{}", serde_json::to_string(&output).unwrap());
+    } else {
+        println!();
+        for r in &results {
+            if r.passed {
+                log::success(&format!("  PASS  {}", r.name));
+            } else {
+                log::error(&format!("  FAIL  {}", r.name));
+            }
+        }
+        println!();
+        if failed == 0 {
+            log::success(&format!("All {total} tests passed"));
         } else {
-            log::error(&format!("  FAIL  {}", r.name));
+            log::error(&format!("{failed}/{total} tests failed"));
         }
     }
 
-    println!();
-    if failed == 0 {
-        log::success(&format!("All {total} tests passed"));
-        Ok(())
-    } else {
-        log::error(&format!("{failed}/{total} tests failed"));
+    if failed > 0 {
         bail!("{failed} test(s) failed");
     }
+    Ok(())
 }
 
 // ─── HW commands ───
