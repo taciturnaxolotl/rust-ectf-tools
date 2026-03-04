@@ -87,6 +87,82 @@ For CI environments, you can configure the tool entirely via environment variabl
 
 If both `ECTF_TOKEN` and `ECTF_GIT_URL` are set, no config file is needed. If a config file exists, env vars override individual fields.
 
+### JSON Output (`--json`)
+
+Most commands support `--json` for machine-readable output. The process exit code is still non-zero on failure.
+
+#### `tools test --json`
+
+```json
+{
+  "total": 15,
+  "passed": 14,
+  "failed": 1,
+  "tests": [
+    {
+      "name": "list_empty",
+      "passed": true,
+      "duration_secs": 0.123
+    },
+    {
+      "name": "bad_pin",
+      "passed": false,
+      "duration_secs": 1.234,
+      "error": "Expected bad pin to fail, but it succeeded"
+    }
+  ]
+}
+```
+
+#### `api test submit --json` / `api clone submit --json` / `api submit --json`
+
+```json
+{
+  "flow": "test",
+  "id": "abc12345-1234-1234-1234-123456789abc"
+}
+```
+
+#### `api test ls --json` / `api clone ls --json` / `api remote ls --json`
+
+```json
+{
+  "flows": [
+    {
+      "id": "abc12345-1234-1234-1234-123456789abc",
+      "submitted": "2026-02-11T22:05:47.000000Z",
+      "status": "succeeded",
+      "completed": true
+    }
+  ]
+}
+```
+
+#### `api test info --json` / `api clone info --json` / `api remote info --json`
+
+```json
+{
+  "flow": "test",
+  "id": "abc12345-1234-1234-1234-123456789abc",
+  "submitted": "2026-02-11T22:05:47.000000Z",
+  "status": "succeeded",
+  "completed": true,
+  "params": {
+    "git_url": "https://github.com/example/repo.git",
+    "commit_hash": "abc1234"
+  },
+  "jobs": [
+    {
+      "name": "build",
+      "id": "def12345-1234-1234-1234-123456789abc",
+      "status": "succeeded",
+      "has_artifacts": true,
+      "private": false
+    }
+  ]
+}
+```
+
 ### Hardware Bootloader Tools (MSPM0L2228)
 
 ```bash

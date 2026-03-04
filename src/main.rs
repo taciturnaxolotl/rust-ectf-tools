@@ -106,6 +106,9 @@ enum ApiCmd {
     Submit {
         /// Git commit hash
         commit: String,
+        /// Output result as JSON for CI
+        #[arg(long)]
+        json: bool,
     },
     /// Submit a PNG for the Team Photo flag
     Photo {
@@ -164,11 +167,17 @@ enum FlowCmd {
         /// Number of flows to show (0 for all)
         #[arg(short, long, default_value = "5")]
         number: usize,
+        /// Output result as JSON for CI
+        #[arg(long)]
+        json: bool,
     },
     /// Get flow details
     Info {
         /// Flow ID
         id: String,
+        /// Output result as JSON for CI
+        #[arg(long)]
+        json: bool,
     },
     /// Submit a commit
     Submit {
@@ -177,6 +186,9 @@ enum FlowCmd {
         /// Override git URL
         #[arg(short, long)]
         url: Option<String>,
+        /// Output result as JSON for CI
+        #[arg(long)]
+        json: bool,
     },
     /// Cancel a flow
     Cancel {
@@ -211,11 +223,17 @@ enum RemoteCmd {
         /// Number of flows to show (0 for all)
         #[arg(short, long, default_value = "5")]
         number: usize,
+        /// Output result as JSON for CI
+        #[arg(long)]
+        json: bool,
     },
     /// Get remote flow details
     Info {
         /// Flow ID
         id: String,
+        /// Output result as JSON for CI
+        #[arg(long)]
+        json: bool,
     },
     /// Cancel a remote flow
     Cancel {
@@ -572,7 +590,7 @@ fn run_config(
 
 fn run_api(cmd: ApiCmd) -> Result<()> {
     match cmd {
-        ApiCmd::Submit { commit } => api::cmd_submit(&commit),
+        ApiCmd::Submit { commit, json } => api::cmd_submit(&commit, json),
         ApiCmd::Photo { file } => api::cmd_photo(&file),
         ApiCmd::Design { file } => api::cmd_design(&file),
         ApiCmd::Steal { team, digest } => api::cmd_steal(&team, &digest),
@@ -590,10 +608,10 @@ fn run_api(cmd: ApiCmd) -> Result<()> {
 
 fn run_flow(flow: &str, cmd: FlowCmd) -> Result<()> {
     match cmd {
-        FlowCmd::Ls { number } => api::cmd_flow_list(flow, number),
-        FlowCmd::Info { id } => api::cmd_flow_info(flow, &id),
-        FlowCmd::Submit { commit, url } => {
-            api::cmd_flow_submit(flow, &commit, url.as_deref())
+        FlowCmd::Ls { number, json } => api::cmd_flow_list(flow, number, json),
+        FlowCmd::Info { id, json } => api::cmd_flow_info(flow, &id, json),
+        FlowCmd::Submit { commit, url, json } => {
+            api::cmd_flow_submit(flow, &commit, url.as_deref(), json)
         }
         FlowCmd::Cancel { id } => api::cmd_flow_cancel(flow, &id),
         FlowCmd::Get { job_id, out } => api::cmd_flow_get(flow, &job_id, &out),
@@ -608,8 +626,8 @@ fn run_remote(cmd: RemoteCmd) -> Result<()> {
             team,
             timeout,
         } => api::cmd_remote_connect(&management_port, &transfer_port, &team, timeout),
-        RemoteCmd::Ls { number } => api::cmd_flow_list("remote", number),
-        RemoteCmd::Info { id } => api::cmd_flow_info("remote", &id),
+        RemoteCmd::Ls { number, json } => api::cmd_flow_list("remote", number, json),
+        RemoteCmd::Info { id, json } => api::cmd_flow_info("remote", &id, json),
         RemoteCmd::Cancel { id } => api::cmd_flow_cancel("remote", &id),
         RemoteCmd::Get { job_id, out } => api::cmd_flow_get("remote", &job_id, &out),
     }

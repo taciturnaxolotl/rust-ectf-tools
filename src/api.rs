@@ -300,9 +300,26 @@ fn flow_overall_status(f: &Flow) -> String {
     }
 }
 
-pub fn cmd_flow_list(flow: &str, count: usize) -> Result<()> {
+pub fn cmd_flow_list(flow: &str, count: usize, json: bool) -> Result<()> {
     let api = ApiClient::new()?;
     let flows = api.flow_list(flow, count)?;
+
+    if json {
+        let items: Vec<serde_json::Value> = flows
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "id": f.id,
+                    "submitted": f.submit_time,
+                    "status": flow_overall_status(f).to_lowercase(),
+                    "completed": f.completed,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&serde_json::json!({ "flows": items })).unwrap());
+        return Ok(());
+    }
+
     if flows.is_empty() {
         log::info("No flows found");
         return Ok(());
@@ -348,9 +365,37 @@ pub fn cmd_flow_list(flow: &str, count: usize) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_flow_info(flow: &str, id: &str) -> Result<()> {
+pub fn cmd_flow_info(flow: &str, id: &str, json: bool) -> Result<()> {
     let api = ApiClient::new()?;
     let f = api.flow_info(flow, id)?;
+
+    if json {
+        let jobs: Vec<serde_json::Value> = f
+            .jobs
+            .iter()
+            .map(|j| {
+                serde_json::json!({
+                    "name": j.name,
+                    "id": j.id,
+                    "status": j.status,
+                    "has_artifacts": j.has_artifacts,
+                    "private": j.private,
+                })
+            })
+            .collect();
+        let output = serde_json::json!({
+            "flow": flow,
+            "id": f.id,
+            "submitted": f.submit_time,
+            "status": flow_overall_status(&f).to_lowercase(),
+            "completed": f.completed,
+            "params": f.params,
+            "jobs": jobs,
+        });
+        println!("{}", serde_json::to_string(&output).unwrap());
+        return Ok(());
+    }
+
     let status = flow_overall_status(&f);
     let sc = status_color(&status.to_lowercase());
     let when = relative_time(&f.submit_time);
@@ -401,7 +446,7 @@ pub fn cmd_flow_info(flow: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_flow_submit(flow: &str, commit: &str, url: Option<&str>) -> Result<()> {
+pub fn cmd_flow_submit(flow: &str, commit: &str, url: Option<&str>, json: bool) -> Result<()> {
     let api = ApiClient::new()?;
     let git_url = url
         .map(|s| s.to_string())
@@ -411,7 +456,12 @@ pub fn cmd_flow_submit(flow: &str, commit: &str, url: Option<&str>) -> Result<()
         "commit_hash": commit,
     });
     let id = api.flow_submit(flow, &body)?;
-    log::success(&format!("Submitted {flow} flow: {id}"));
+    if json {
+        let output = serde_json::json!({ "flow": flow, "id": id.trim() });
+        println!("{}", serde_json::to_string(&output).unwrap());
+    } else {
+        log::success(&format!("Submitted {flow} flow: {id}"));
+    }
     Ok(())
 }
 
@@ -430,8 +480,8 @@ pub fn cmd_flow_get(flow: &str, job_id: &str, out: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_submit(commit: &str) -> Result<()> {
-    cmd_flow_submit("submit", commit, None)
+pub fn cmd_submit(commit: &str, json: bool) -> Result<()> {
+    cmd_flow_submit("submit", commit, None, json)
 }
 
 pub fn cmd_photo(file: &PathBuf) -> Result<()> {
