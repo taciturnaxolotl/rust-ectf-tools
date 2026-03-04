@@ -38,7 +38,54 @@ ectf-tools tools /dev/tty.usbmodemXXX listen
 
 # Receive a file from another HSM
 ectf-tools tools /dev/tty.usbmodemXXX receive 1a2b3c 0 1
+
+# Run the hardware test suite
+ectf-tools tools /dev/tty.usbmodemXXX test 1a2b3c 0x4321 /dev/tty.usbmodemYYY
+
+# Run tests without a second HSM
+ectf-tools tools /dev/tty.usbmodemXXX test 1a2b3c 0x4321 --no-transfer
+
+# Output test results as JSON (for CI)
+ectf-tools tools /dev/tty.usbmodemXXX test 1a2b3c 0x4321 --no-transfer --json
 ```
+
+### API Commands
+
+```bash
+# Configure your API credentials
+ectf-tools config --token <TOKEN> --git-url <GIT_URL>
+
+# Submit a design for testing
+ectf-tools api test submit <COMMIT_HASH>
+
+# List recent test flows
+ectf-tools api test ls
+
+# Get details on a specific flow
+ectf-tools api test info <FLOW_ID>
+
+# Download job output
+ectf-tools api test get <JOB_ID> output.tar.gz
+
+# Submit to handoff
+ectf-tools api submit <COMMIT_HASH>
+
+# List and download attack packages
+ectf-tools api list
+ectf-tools api get <PACKAGE_NAME>
+```
+
+### Environment Variables
+
+For CI environments, you can configure the tool entirely via environment variables instead of the config file:
+
+| Variable | Description | Required |
+|---|---|---|
+| `ECTF_TOKEN` | API bearer token | Yes (with `ECTF_GIT_URL`) |
+| `ECTF_GIT_URL` | Git repository URL | Yes (with `ECTF_TOKEN`) |
+| `ECTF_API_URL` | API base URL (default: `https://api.ectf.mitre.org`) | No |
+
+If both `ECTF_TOKEN` and `ECTF_GIT_URL` are set, no config file is needed. If a config file exists, env vars override individual fields.
 
 ### Hardware Bootloader Tools (MSPM0L2228)
 
