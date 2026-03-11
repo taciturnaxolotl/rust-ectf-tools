@@ -635,6 +635,16 @@ fn run_remote(cmd: RemoteCmd) -> Result<()> {
 
 // ─── Tools commands ───
 
+fn report_timing(op: &str, elapsed_ms: u128, limit_ms: u128) {
+    if elapsed_ms > limit_ms {
+        log::warning(&format!(
+            "{op} took {elapsed_ms}ms — exceeds {limit_ms}ms spec limit"
+        ));
+    } else {
+        log::info(&format!("{op} completed in {elapsed_ms}ms (limit: {limit_ms}ms)"));
+    }
+}
+
 fn run_tools(port: &str, cmd: ToolsCmd) -> Result<()> {
     let mut hsm = HSMIntf::open(port).context("Failed to open serial port")?;
 
@@ -689,8 +699,11 @@ fn run_tools(port: &str, cmd: ToolsCmd) -> Result<()> {
             frame.extend_from_slice(&(contents.len() as u16).to_le_bytes());
             frame.extend_from_slice(&contents);
 
+            let t = std::time::Instant::now();
             hsm.send_respond(Opcode::Write, &frame)?;
+            let ms = t.elapsed().as_millis();
             log::success("Write successful");
+            report_timing("Write", ms, 3000);
         }
 
         ToolsCmd::Read {
@@ -706,7 +719,9 @@ fn run_tools(port: &str, cmd: ToolsCmd) -> Result<()> {
             frame.extend_from_slice(pin.as_bytes());
             frame.push(slot);
 
+            let t = std::time::Instant::now();
             let resp = hsm.send_respond(Opcode::Read, &frame)?;
+            let ms = t.elapsed().as_millis();
             let body = &resp.body;
             if body.len() < MAX_NAME_LEN {
                 bail!("Read response too short");
@@ -733,11 +748,14 @@ fn run_tools(port: &str, cmd: ToolsCmd) -> Result<()> {
                 "Read successful. Wrote file to {}",
                 full_path.canonicalize().unwrap_or(full_path).display()
             ));
+            report_timing("Read", ms, 3000);
         }
 
         ToolsCmd::List { pin } => {
             validate_pin(&pin)?;
+            let t = std::time::Instant::now();
             let resp = hsm.send_respond(Opcode::List, pin.as_bytes())?;
+            let ms = t.elapsed().as_millis();
             let files = unpack_files(&resp.body)?;
             for (slot, group_id, name) in &files {
                 log::info(&format!(
@@ -745,11 +763,14 @@ fn run_tools(port: &str, cmd: ToolsCmd) -> Result<()> {
                 ));
             }
             log::success("List successful");
+            report_timing("List", ms, 500);
         }
 
         ToolsCmd::Interrogate { pin } => {
             validate_pin(&pin)?;
+            let t = std::time::Instant::now();
             let resp = hsm.send_respond(Opcode::Interrogate, pin.as_bytes())?;
+            let ms = t.elapsed().as_millis();
             let files = unpack_files(&resp.body)?;
             for (slot, group_id, name) in &files {
                 log::info(&format!(
@@ -757,11 +778,15 @@ fn run_tools(port: &str, cmd: ToolsCmd) -> Result<()> {
                 ));
             }
             log::success("Interrogate successful");
+            report_timing("Interrogate", ms, 1000);
         }
 
         ToolsCmd::Listen => {
+            let t = std::time::Instant::now();
             hsm.send_respond(Opcode::Listen, &[])?;
+            let ms = t.elapsed().as_millis();
             log::success("Listen successful");
+            report_timing("Listen (device wake)", ms, 1000);
         }
 
         ToolsCmd::Receive {
@@ -778,10 +803,13 @@ fn run_tools(port: &str, cmd: ToolsCmd) -> Result<()> {
             frame.push(read_slot);
             frame.push(write_slot);
 
+            let t = std::time::Instant::now();
             hsm.send_respond(Opcode::Receive, &frame)?;
+            let ms = t.elapsed().as_millis();
             log::success(&format!(
                 "Receive successful. Wrote file to local slot {write_slot}"
             ));
+            report_timing("Receive", ms, 3000);
         }
 
         ToolsCmd::Test {
