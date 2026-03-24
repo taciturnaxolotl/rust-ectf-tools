@@ -139,6 +139,19 @@ enum ApiCmd {
         /// Overwrite if file exists
         #[arg(short, long)]
         force: bool,
+        /// Decrypt and extract with the given key
+        #[arg(short, long)]
+        decrypt: Option<String>,
+    },
+    /// Decrypt and extract an attack package
+    Decrypt {
+        /// Encrypted package file (e.g. mitre.enc)
+        file: PathBuf,
+        /// Decryption key (hex string)
+        key: String,
+        /// Output directory (defaults to package name without .enc)
+        #[arg(short, long)]
+        out: Option<PathBuf>,
     },
     /// Test that your design can be cloned by the API
     #[command(arg_required_else_help = true)]
@@ -599,7 +612,16 @@ fn run_api(cmd: ApiCmd) -> Result<()> {
             package,
             out,
             force,
-        } => api::cmd_get_package(&package, out.as_ref(), force),
+            decrypt,
+        } => {
+            api::cmd_get_package(&package, out.as_ref(), force)?;
+            if let Some(key) = decrypt {
+                let enc_path = out.unwrap_or_else(|| PathBuf::from(&package));
+                cmd_decrypt(&enc_path, &key, None)?;
+            }
+            Ok(())
+        }
+        ApiCmd::Decrypt { file, key, out } => cmd_decrypt(&file, &key, out.as_ref()),
         ApiCmd::Clone { command } => run_flow("clone", command),
         ApiCmd::Test { command } => run_flow("test", command),
         ApiCmd::Remote { command } => run_remote(command),
@@ -631,6 +653,85 @@ fn run_remote(cmd: RemoteCmd) -> Result<()> {
         RemoteCmd::Cancel { id } => api::cmd_flow_cancel("remote", &id),
         RemoteCmd::Get { job_id, out } => api::cmd_flow_get("remote", &job_id, &out),
     }
+}
+
+// ─── Decrypt helper ───
+
+fn cmd_decrypt(file: &PathBuf, key: &str, out: Option<&PathBuf>) -> Result<()> {
+    // Determine output directory
+    let out_dir = match out {
+        Some(p) => p.clone(),
+        None => {
+            let stem = file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .context("cannot determine output name from input file")?;
+            // Strip .enc -> stem, but if the stem itself has an extension (e.g. foo.enc),
+            // just use the stem directly
+            PathBuf::from(stem)
+        }
+    };
+
+    if out_dir.exists() {
+        bail!("output directory '{}' already exists", out_dir.display());
+    }
+
+    // Decrypt using openssl
+    log::info(&format!("decrypting '{}'...", file.display()));
+    let output = std::process::Command::new("openssl")
+        .args([
+            "enc",
+            "-d",
+            "-aes-256-cbc",
+            "-pbkdf2",
+            "-salt",
+            "-k",
+            key,
+            "-in",
+        ])
+        .arg(file)
+        .output()
+        .context("failed to run openssl — is it installed?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("openssl decryption failed: {stderr}");
+    }
+
+    let zip_data = output.stdout;
+
+    // Extract zip into output directory
+    log::info(&format!("extracting to '{}'...", out_dir.display()));
+    fs::create_dir_all(&out_dir).context("failed to create output directory")?;
+
+    let cursor = std::io::Cursor::new(&zip_data);
+    let mut archive = zip::ZipArchive::new(cursor).context("failed to read zip archive")?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        let entry_path = match entry.enclosed_name() {
+            Some(p) => p.to_owned(),
+            None => continue, // skip entries with unsafe paths
+        };
+        let dest = out_dir.join(&entry_path);
+
+        if entry.is_dir() {
+            fs::create_dir_all(&dest)?;
+        } else {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut out_file = fs::File::create(&dest)?;
+            std::io::copy(&mut entry, &mut out_file)?;
+        }
+    }
+
+    log::success(&format!(
+        "extracted {} files to '{}'",
+        archive.len(),
+        out_dir.display()
+    ));
+    Ok(())
 }
 
 // ─── Tools commands ───
