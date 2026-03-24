@@ -222,7 +222,8 @@ impl ApiClient {
 
     pub fn flow_submit(&self, flow: &str, body: &serde_json::Value) -> Result<String> {
         let resp = self.post_json(&format!("flow/{flow}"), body)?;
-        Ok(resp.text()?)
+        let text = resp.text()?;
+        Ok(text.trim().trim_matches('"').to_string())
     }
 
     pub fn flow_cancel(&self, flow: &str, id: &str) -> Result<()> {
@@ -562,32 +563,147 @@ pub fn cmd_remote_connect(
     let api = ApiClient::new()?;
 
     // Submit remote flow
-    let body = serde_json::json!({"team": team});
+    let body = serde_json::json!({"target_team": team});
     let flow_id = api.flow_submit("remote", &body)?;
     log::info(&format!("Submitted remote flow: {flow_id}"));
 
-    // Poll for get_ports job
-    log::info("Waiting for port assignment...");
-    let port: u16 = loop {
-        std::thread::sleep(Duration::from_secs(3));
-        let flow = api.flow_info("remote", &flow_id)?;
-        if let Some(job) = flow.jobs.iter().find(|j| j.name == "get_ports") {
-            match job.status.as_str() {
-                "succeeded" => {
-                    let data = api.flow_pull("remote", &job.id)?;
-                    let port_str = String::from_utf8(data)?.trim().to_string();
-                    break port_str.parse().context("Invalid port number")?;
+    remote_bridge(&api, &flow_id, mgmt_port, transfer_port, timeout)
+}
+
+pub fn cmd_remote_attach(
+    mgmt_port: &str,
+    transfer_port: &str,
+    flow_or_team: &str,
+    timeout: u64,
+) -> Result<()> {
+    let api = ApiClient::new()?;
+
+    // If it looks like a UUID, use it directly; otherwise treat as team name
+    let flow_id = if uuid::Uuid::try_parse(flow_or_team).is_ok() {
+        flow_or_team.to_string()
+    } else {
+        // Find the latest non-completed remote flow for this team
+        let flows = api.flow_list("remote", 0)?;
+        let team = flow_or_team.to_lowercase();
+        flows
+            .iter()
+            .find(|f| {
+                !f.completed
+                    && f.params
+                        .get("target_team")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|t| t.to_lowercase() == team)
+            })
+            .map(|f| f.id.clone())
+            .with_context(|| format!("no active remote flow found for team '{flow_or_team}'"))?
+    };
+
+    log::info(&format!("Attaching to remote flow: {flow_id}"));
+    remote_bridge(&api, &flow_id, mgmt_port, transfer_port, timeout)
+}
+
+fn read_port_from_zip(data: &[u8]) -> Result<u16> {
+    let cursor = std::io::Cursor::new(data);
+    let mut archive = zip::ZipArchive::new(cursor).context("failed to read get_ports zip")?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        if entry.name().ends_with("port.out") {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut buf)?;
+            return buf.trim().parse().context("invalid port number in port.out");
+        }
+    }
+    bail!("port.out not found in get_ports output zip")
+}
+
+fn remote_bridge(
+    api: &ApiClient,
+    flow_id: &str,
+    mgmt_port: &str,
+    transfer_port: &str,
+    timeout: u64,
+) -> Result<()> {
+    // Poll until get_ports succeeds AND run_remote_scenario is running
+    log::info("Waiting for remote infrastructure...");
+    let mut port: Option<u16> = None;
+    let wait_start = Instant::now();
+
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let flow = api.flow_info("remote", flow_id)?;
+
+        let get_ports_job = flow.jobs.iter().find(|j| j.name == "get_ports");
+        let run_job = flow.jobs.iter().find(|j| j.name == "run_remote_scenario");
+
+        // Check for failures (only check get_ports if we haven't got the port yet)
+        if port.is_none() {
+            if let Some(job) = &get_ports_job {
+                if job.status == "canceled" || job.status == "failed" {
+                    bail!("get_ports job {}", job.status);
                 }
-                "canceled" | "failed" => bail!("Port assignment failed"),
-                _ => continue,
+            }
+        }
+        if let Some(job) = &run_job {
+            if job.status == "canceled" || job.status == "failed" {
+                eprintln!();
+                bail!("run_remote_scenario job {}", job.status);
+            }
+        }
+
+        // Extract port once get_ports succeeds
+        if port.is_none() {
+            if let Some(job) = &get_ports_job {
+                if job.status == "succeeded" {
+                    let data = api.flow_pull("remote", &job.id)?;
+                    let p = read_port_from_zip(&data)?;
+                    log::success(&format!("Remote TCP port: {p}"));
+                    port = Some(p);
+                }
+            }
+        }
+
+        // Only connect once we have the port AND the scenario is running
+        if let (Some(p), Some(job)) = (port, &run_job) {
+            if job.status == "running" {
+                if port.is_some() {
+                    eprintln!();
+                }
+                log::info(&format!("Scenario running, connecting to port {p}..."));
+                break;
+            }
+            if job.status == "queued" && port.is_some() {
+                let elapsed = wait_start.elapsed().as_secs();
+                eprint!("\r[info]  Waiting for available hardware... {elapsed}s");
+            }
+        }
+    }
+
+    let port = port.unwrap();
+
+    // Connect to remote server with retry
+    let tcp = {
+        let mut delay_ms: u64 = 1000;
+        loop {
+            match TcpStream::connect_timeout(
+                &format!("{REMOTE_HOST}:{port}").parse()?,
+                Duration::from_secs(5),
+            ) {
+                Ok(s) => break s,
+                Err(e) => {
+                    log::debug(&format!("TCP connect attempt failed: {e}, retrying..."));
+                    // Check if scenario is still alive
+                    let flow = api.flow_info("remote", flow_id)?;
+                    if let Some(job) = flow.jobs.iter().find(|j| j.name == "run_remote_scenario") {
+                        if job.status == "failed" || job.status == "canceled" {
+                            bail!("run_remote_scenario ended with status: {}", job.status);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    delay_ms = (delay_ms * 3 / 2).min(2000);
+                }
             }
         }
     };
-
-    log::info(&format!("Assigned port {port}, connecting..."));
-
-    // Connect to remote server
-    let tcp = TcpStream::connect((REMOTE_HOST, port)).context("Failed to connect to remote")?;
     tcp.set_nodelay(true)?;
     log::success("Connected to remote server");
 
@@ -659,7 +775,7 @@ pub fn cmd_remote_connect(
             log::warning("Remote scenario timed out");
             break;
         }
-        match api.flow_info("remote", &flow_id) {
+        match api.flow_info("remote", flow_id) {
             Ok(flow) => {
                 if let Some(job) = flow
                     .jobs

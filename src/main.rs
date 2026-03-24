@@ -231,6 +231,18 @@ enum RemoteCmd {
         #[arg(short, long, default_value = "120")]
         timeout: u64,
     },
+    /// Attach to an existing remote flow
+    Attach {
+        /// HSM management serial port
+        management_port: String,
+        /// Transfer interface UART port
+        transfer_port: String,
+        /// Flow ID or team name
+        flow_or_team: String,
+        /// Timeout in seconds
+        #[arg(short, long, default_value = "120")]
+        timeout: u64,
+    },
     /// List recent remote flows
     Ls {
         /// Number of flows to show (0 for all)
@@ -648,6 +660,12 @@ fn run_remote(cmd: RemoteCmd) -> Result<()> {
             team,
             timeout,
         } => api::cmd_remote_connect(&management_port, &transfer_port, &team, timeout),
+        RemoteCmd::Attach {
+            management_port,
+            transfer_port,
+            flow_or_team,
+            timeout,
+        } => api::cmd_remote_attach(&management_port, &transfer_port, &flow_or_team, timeout),
         RemoteCmd::Ls { number, json } => api::cmd_flow_list("remote", number, json),
         RemoteCmd::Info { id, json } => api::cmd_flow_info("remote", &id, json),
         RemoteCmd::Cancel { id } => api::cmd_flow_cancel("remote", &id),
